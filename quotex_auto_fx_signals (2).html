@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Auto FX Signals — 1/2/5 min (real market data)</title>
+<style>
+  :root{--bg:#061018;--card:#0f1720;--muted:#9aa6b2;--accent:#3ddc84;--danger:#ff6b6b}
+  *{box-sizing:border-box;font-family:Inter,system-ui,Segoe UI,Roboto,Arial}
+  body{margin:0;background:linear-gradient(180deg,#03050a,#07121a);color:#e6eef3;padding:18px;min-height:100vh}
+  .container{max-width:1100px;margin:0 auto}
+  header{display:flex;justify-content:space-between;align-items:center}
+  h1{margin:0;font-size:20px}
+  .lead{color:var(--muted);font-size:13px}
+  .card{background:var(--card);padding:12px;border-radius:10px;margin-top:12px}
+  input,select,button{background:transparent;border:1px solid rgba(255,255,255,0.06);color:var(--muted);padding:8px;border-radius:8px}
+  .flex{display:flex;gap:8px;align-items:center}
+  .pairs{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+  .pair-pill{background:rgba(255,255,255,0.03);padding:6px 8px;border-radius:8px;font-weight:700}
+  .signals-list{max-height:420px;overflow:auto;margin-top:8px}
+  .signal{display:flex;justify-content:space-between;gap:8px;padding:10px;border-radius:8px;margin-bottom:8px;border:1px solid rgba(255,255,255,0.03)}
+  .small{font-size:12px;color:var(--muted)}
+  .green{color:#3ddc84}
+  .red{color:#ff6b6b}
+  .conf{min-width:120px}
+  footer{margin-top:14px;color:var(--muted);font-size:13px}
+  @media(max-width:900px){header{flex-direction:column;align-items:flex-start;gap:8px}}
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div>
+      <h1>Auto FX Signals</h1>
+      <div class="lead">Real market FX quotes (exchangerate.host) → simple strategy generates 1/2/5 min signals with confidence.</div>
+    </div>
+    <div class="small">Polling every 5s • No server • Open in Chrome</div>
+  </header>
+
+  <div class="card">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <input id="pairInput" placeholder="Add currency pair (e.g. EUR/USD)" />
+      <select id="durationDefault"><option value="60">1 min</option><option value="120" selected>2 min</option><option value="300">5 min</option></select>
+      <button onclick="addPair()">Add Pair</button>
+      <button onclick="startMonitoring()">Start</button>
+      <button onclick="stopMonitoring()">Stop</button>
+      <button onclick="clearHistory()">Clear History</button>
+    </div>
+    <div class="small" style="margin-top:8px">Pairs monitored:</div>
+    <div class="pairs" id="pairsList"></div>
+    <div class="small" style="margin-top:8px">Strategy: short MA (3 ticks) vs long MA (9 ticks) on live ticks. Crossover → generate signal. Confidence ~ strength of crossover.</div>
+  </div>
+
+  <div class="card">
+    <strong>Active / Generated Signals</strong>
+    <div class="signals-list" id="signalsList"></div>
+    <div class="small" style="margin-top:8px">Notes: This demo uses exchangerate.host convert endpoint. For true tick-by-tick professional data you need a paid FX data provider. Use signals at your own risk.</div>
+  </div>
+
+  <div class="card">
+    <strong>Monitoring debug (latest quotes)</strong>
+    <div id="debug" class="small"></div>
+  </div>
+
+  <footer>Local-only • No server • Data from exchangerate.host • Not financial advice</footer>
+</div>
+
+<script>
+/*
+  Auto FX Signal Generator (demo)
+  - Polls exchangerate.host every 5 seconds for each pair's current rate.
+  - Maintains last N ticks per pair, computes short MA (3) and long MA (9).
+  - When a crossover is detected (shortMA crosses above longMA -> BUY, below -> SELL),
+    a signal is generated for the selected duration (1/2/5 min).
+  - Confidence is proportional to relative MA difference (capped 10-100).
+  - Throttles signals per pair by 'cooldown' equal to the chosen duration to avoid spam.
+*/
+
+const POLL_INTERVAL = 5000; // ms
+let monitoring = false;
+const pairs = {}; // pairKey -> {ticks:[], lastSignalAt:0, cooldownUntil:0}
+const signals = []; // history of generated signals (local only)
+
+function pairKeyFrom(str){
+  // normalize forms like EUR/USD, EURUSD, eur/usd
+  const s = str.replace(/\s+/g,'').replace('-','/').replace('_','/').toUpperCase();
+  if(s.includes('/')) return s;
+  if(s.length===6) return s.slice(0,3)+'/'+s.slice(3);
+  return s;
+}
+
+function addPair(){
+  const raw = document.getElementById('pairInput').value.trim();
+  if(!raw) return alert('Enter pair like EUR/USD');
+  const pk = pairKeyFrom(raw);
+  if(pairs[pk]){ document.getElementById('pairInput').value=''; renderPairs(); return; }
+  const duration = parseInt(document.getElementById('durationDefault').value,10);
+  pairs[pk] = {ticks:[],lastSignalAt:0,cooldownUntil:0,duration};
+  document.getElementById('pairInput').value='';
+  renderPairs();
+}
+
+function renderPairs(){
+  const container = document.getElementById('pairsList'); container.innerHTML='';
+  for(const k of Object.keys(pairs)){
+    const el = document.createElement('div'); el.className='pair-pill';
+    el.innerText = k + ' (' + (pairs[k].ticks.length) + ' ticks)';
+    const btn = document.createElement('button'); btn.style.marginLeft='8px'; btn.innerText='Remove'; btn.onclick=()=>{ delete pairs[k]; renderPairs(); }
+    el.appendChild(btn);
+    container.appendChild(el);
+  }
+}
+
+let poller = null;
+
+function startMonitoring(){
+  if(monitoring) return;
+  if(Object.keys(pairs).length===0) return alert('Add at least one pair to monitor');
+  monitoring=true;
+  pollAll(); // immediate
+  poller = setInterval(pollAll,POLL_INTERVAL);
+  document.querySelector('button[onclick="startMonitoring()"]').disabled=true;
+}
+
+function stopMonitoring(){
+  monitoring=false;
+  if(poller) clearInterval(poller);
+  poller=null;
+  document.querySelector('button[onclick="startMonitoring()"]').disabled=false;
+}
+
+async function pollAll(){
+  const debugLines = [];
+  for(const pair of Object.keys(pairs)){
+    try{
+      const [base,quote] = pair.split('/');
+      // exchangerate.host convert endpoint
+      const url = `https://api.exchangerate.host/convert?from=${base}&to=${quote}&places=6`;
+      const res = await fetch(url);
+      if(!res.ok) throw new Error('HTTP '+res.status);
+      const j = await res.json();
+      const rate = j.result;
+      if(typeof rate !== 'number') throw new Error('no rate');
+      const p = pairs[pair];
+      p.ticks.push({t:Date.now(),rate});
+      // keep last 60 ticks max
+      if(p.ticks.length>60) p.ticks.shift();
+      debugLines.push(pair+': '+rate.toFixed(6));
+      analyzePair(pair);
+    }catch(err){
+      debugLines.push(pair+': err');
+      console.error('poll',pair,err);
+    }
+  }
+  document.getElementById('debug').innerText = debugLines.join('  |  ');
+  renderPairs();
+}
+
+function sma(values, window){
+  if(values.length===0) return null;
+  const arr = values.slice(-window);
+  if(arr.length===0) return null;
+  const sum = arr.reduce((s,x)=>s+x.rate,0);
+  return sum/arr.length;
+}
+
+function analyzePair(pair){
+  const p = pairs[pair];
+  if(!p) return;
+  const shortN = 3, longN = 9;
+  if(p.ticks.length < longN) return; // not enough data
+  const shortMA = sma(p.ticks, shortN);
+  const longMA = sma(p.ticks, longN);
+  if(!shortMA || !longMA) return;
+  const now = Date.now();
+  // detect crossover by checking last two positions (previous and current)
+  const prevShort = sma(p.ticks.slice(0,-1), shortN);
+  const prevLong = sma(p.ticks.slice(0,-1), longN);
+  // if prev values exist, detect cross
+  let signalType = null;
+  if(prevShort && prevLong){
+    if(prevShort <= prevLong && shortMA > longMA) signalType = 'buy';
+    if(prevShort >= prevLong && shortMA < longMA) signalType = 'sell';
+  } else {
+    // fallback: check current difference magnitude if big and no prev
+    const diff = shortMA - longMA;
+    if(Math.abs(diff)/longMA > 0.0006){ // threshold
+      signalType = diff>0 ? 'buy' : 'sell';
+    }
+  }
+  if(!signalType) return;
+  // throttle: only create a new signal if cooldown passed
+  if(now < p.cooldownUntil) return;
+  // create signal
+  const relDiff = Math.abs(shortMA-longMA)/longMA; // e.g. 0.0005
+  // map relDiff to confidence: small -> 10, larger -> up to 100
+  let confidence = Math.min(100, Math.round(10 + (relDiff/0.005)*90)); // 0.5% ~ high confidence
+  if(confidence<10) confidence = 10;
+  const sig = {
+    id: 'sig_'+Date.now()+'_'+Math.random().toString(36).slice(2,7),
+    pair: pair,
+    type: signalType,
+    confidence: confidence,
+    duration: p.duration,
+    created: Date.now(),
+    start: Date.now(),
+    outcome: 'pending',
+    priceAtSignal: p.ticks[p.ticks.length-1].rate
+  };
+  signals.unshift(sig);
+  // set cooldown to prevent duplicate signals for same pair until current duration expires
+  p.cooldownUntil = now + (p.duration*1000);
+  renderSignals();
+  // auto play ding
+  playDing();
+}
+
+function renderSignals(){
+  const list = document.getElementById('signalsList'); list.innerHTML='';
+  for(const s of signals){
+    const el = document.createElement('div'); el.className='signal';
+    const left = document.createElement('div');
+    left.innerHTML = `<div style="font-weight:700">${s.pair} • ${s.type.toUpperCase()}</div><div class="small">price: ${s.priceAtSignal.toFixed(6)} • conf: ${s.confidence}%</div>`;
+    const mid = document.createElement('div'); mid.className='conf';
+    const timeLeft = Math.max(0, Math.ceil((s.start + s.duration*1000 - Date.now())/1000));
+    mid.innerHTML = `<div style="font-weight:700">${formatTime(timeLeft)}</div><div class="small">dur ${s.duration}s</div>`;
+    const right = document.createElement('div');
+    const btnWin = document.createElement('button'); btnWin.innerText='✅'; btnWin.onclick=()=>markOutcome(s.id,'win');
+    const btnLoss = document.createElement('button'); btnLoss.innerText='❌'; btnLoss.onclick=()=>markOutcome(s.id,'loss');
+    right.appendChild(btnWin); right.appendChild(btnLoss);
+    el.appendChild(left); el.appendChild(mid); el.appendChild(right);
+    if(s.outcome==='win') el.style.borderLeft='4px solid rgba(61,220,132,0.6)';
+    if(s.outcome==='loss') el.style.borderLeft='4px solid rgba(255,107,107,0.6)';
+    // highlight when expired but still pending
+    if(s.outcome==='pending' && Date.now() >= s.start + s.duration*1000){
+      el.style.boxShadow = '0 0 0 4px rgba(61,220,132,0.08)';
+    }
+    list.appendChild(el);
+  }
+  // trim history to 200
+  if(signals.length>200) signals.length=200;
+}
+
+function formatTime(sec){
+  const m = Math.floor(sec/60); const s = sec%60;
+  return (m<10?'0'+m:m)+':'+(s<10?'0'+s:s);
+}
+
+function markOutcome(id,outcome){
+  const s = signals.find(x=>x.id===id); if(!s) return;
+  s.outcome = outcome;
+  s.outcomeTime = Date.now();
+  renderSignals();
+}
+
+function playDing(){ try{ new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=').play().catch(()=>{}); }catch(e){} }
+
+function clearHistory(){ if(!confirm('Clear signal history?')) return; signals.length=0; renderSignals(); }
+
+function stopMonitoringAndClear(){
+  stopMonitoring();
+  for(const k of Object.keys(pairs)) delete pairs[k];
+  renderPairs();
+  document.getElementById('debug').innerText='';
+  renderSignals();
+}
+
+// tick to update signal timers and compact expired ones visually
+setInterval(()=>{
+  // remove old signals older than 24 hours
+  const cutoff = Date.now() - 24*3600*1000;
+  for(let i=signals.length-1;i>=0;i--){
+    if(signals[i].created < cutoff) signals.splice(i,1);
+  }
+  renderSignals();
+},1000);
+
+// convenience: add some common pairs
+['EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF','EUR/GBP'].forEach(p=>{
+  const pk = pairKeyFrom(p); pairs[pk] = {ticks:[],lastSignalAt:0,cooldownUntil:0,duration:120};
+});
+renderPairs();
+renderSignals();
+
+</script>
+</body>
+</html>
